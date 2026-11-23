@@ -182,7 +182,7 @@ pub mod simple_vault {
         Ok(())
     }
 
-    // ─── Неделя 12: Raydium CLMM (код в raydium.rs) ─────────────────────────
+    // ─── Недели 12–13: Raydium CLMM (код в raydium.rs) ──────────────────────
 
     /// Админ заводит vault второй токен пары (TOKEN_B пула).
     pub fn add_pair_token(ctx: Context<AddPairToken>) -> Result<()> {
@@ -197,6 +197,45 @@ pub mod simple_vault {
         a_to_b: bool,
     ) -> Result<()> {
         raydium::swap(ctx, amount_in, min_amount_out, a_to_b)
+    }
+
+    /// Неделя 13. Админ открывает позицию vault в ценовом диапазоне.
+    pub fn open_position<'a, 'b, 'c: 'info, 'info>(
+        ctx: Context<'a, 'b, 'c, 'info, VaultOpenPosition<'info>>,
+        tick_lower_index: i32,
+        tick_upper_index: i32,
+        tick_array_lower_start_index: i32,
+        tick_array_upper_start_index: i32,
+        amount_0_max: u64,
+        amount_1_max: u64,
+        base_0: bool,
+    ) -> Result<()> {
+        raydium::open_position(
+            ctx,
+            tick_lower_index,
+            tick_upper_index,
+            tick_array_lower_start_index,
+            tick_array_upper_start_index,
+            amount_0_max,
+            amount_1_max,
+            base_0,
+        )
+    }
+
+    /// Неделя 13. Админ забирает накопленные комиссии позиции в vault.
+    pub fn collect_fees<'a, 'b, 'c: 'info, 'info>(
+        ctx: Context<'a, 'b, 'c, 'info, VaultPosition<'info>>,
+    ) -> Result<()> {
+        raydium::collect_fees(ctx)
+    }
+
+    /// Неделя 13. Админ закрывает позицию: всё возвращается в vault.
+    pub fn close_position<'a, 'b, 'c: 'info, 'info>(
+        ctx: Context<'a, 'b, 'c, 'info, VaultPosition<'info>>,
+        amount_0_min: u64,
+        amount_1_min: u64,
+    ) -> Result<()> {
+        raydium::close_position(ctx, amount_0_min, amount_1_min)
     }
 
     /// Вернуть vault в обычный режим, когда всё снова в TOKEN_A.
@@ -401,10 +440,10 @@ pub struct Withdraw<'info> {
 #[account]
 #[derive(Default)]
 pub struct VaultState {
-    pub admin: Pubkey,               // 32 — кто может создавать/настраивать
-    pub token_mint: Pubkey,          // 32 — SPL-токен, который принимает vault
-    pub vault_token_account: Pubkey, // 32 — токен-аккаунт vault PDA (где лежат токены)
-    pub share_mint: Pubkey,          // 32 — mint токенов-долей (shares)
+    pub admin: Pubkey,               // 32
+    pub token_mint: Pubkey,          // 32 — SPL-токен vault'а
+    pub vault_token_account: Pubkey, // 32 — PDA для токенов
+    pub share_mint: Pubkey,          // 32 — mint для shares
     pub total_tokens: u64,           // 8  — всего токенов в vault
     pub total_shares: u64,           // 8  — всего выпущено shares
     pub bump: u8,                    // 1
@@ -441,11 +480,11 @@ impl UserCard {
 pub enum VaultError {
     #[msg("Amount must be greater than zero")]
     ZeroAmount,
-    #[msg("Deposit amount is too small to mint at least 1 share")]
+    #[msg("Shares would be zero - deposit too small")]
     SharesTooSmall,
-    #[msg("Vault is empty, nothing to withdraw")]
+    #[msg("Vault is empty")]
     VaultEmpty,
-    #[msg("Withdraw shares amount is too small to receive at least 1 token")]
+    #[msg("Withdraw amount too small")]
     WithdrawTooSmall,
     #[msg("Math overflow")]
     MathOverflow,
