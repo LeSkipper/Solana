@@ -1,15 +1,15 @@
 # Simple Vault — практика Anchor
 
-Учебный контракт на Anchor 0.31.1 (Solana). Сейчас он делает четыре вещи, а на неделе 11 к нему добавляется скрипт для Raydium:
+Учебный контракт на Anchor 0.31.1 (Solana). Что он умеет по неделям:
 
 1. **Vault создан** — админ создаёт vault для SPL-токена. *(неделя 8)*
 2. **У каждого пользователя своя «карточка»** — личный аккаунт (PDA) внутри vault. *(неделя 8)*
 3. **Депозит и share-токены** — пользователь вносит токены и получает share-токены. *(неделя 9)*
 4. **CPI и вывод** — пользователь возвращает share-токены и забирает свои токены. *(неделя 10)*
-
 5. **Свои токены и свой CLMM-пул на Raydium (devnet)** — скрипт `create-pool`, сам контракт на этой неделе не меняется. *(неделя 11)*
+6. **Swap через Raydium** — vault обменивает свои токены через ваш пул. *(неделя 12)*
 
-Контракт будет дорабатываться (swap и позиции через Raydium), поэтому он намеренно небольшой.
+Контракт будет дорабатываться (позиции через Raydium на неделе 13), поэтому он структурирован модульно.
 
 ---
 
@@ -20,7 +20,13 @@ initialize_vault    создаёт VaultState PDA, vault token account и share 
 create_user_card    создаёт UserCard PDA — личную карточку пользователя в vault
 deposit(amount)     переводит токены пользователя в vault → печатает ему shares
 withdraw(shares)    сжигает shares пользователя → отправляет ему токены из vault
+
+add_pair_token      админ заводит vault второй токен пары (TOKEN_B пула)
+swap                неделя 12: админ меняет токены vault через пул Raydium
+sync_vault          админ возвращает vault в обычный режим, когда всё снова в TOKEN_A
 ```
+
+Код Raydium-инструкций лежит отдельно: `programs/simple_vault/src/raydium.rs`.
 
 ### `initialize_vault`
 
@@ -154,6 +160,59 @@ yarn create-pool
 
 ---
 
+## Неделя 12 — swap через Raydium
+
+### Главная идея: деньги vault «уходят в рынок»
+
+До недели 12 все деньги vault лежали в одном токене (TOKEN_A), и `total_tokens` всегда был равен
+балансу vault. Теперь админ может обменять часть TOKEN_A на TOKEN_B.
+В это время непонятно, сколько стоит vault в TOKEN_A, а значит, нельзя честно посчитать shares.
+
+Поэтому правило простое:
+
+1. Как только админ делает `swap`, vault переходит в режим **«в рынке»** (`in_market = true`).
+   `deposit` и `withdraw` в это время возвращают ошибку `InMarket`.
+2. Когда админ обменял весь TOKEN_B обратно, он вызывает `sync_vault`
+   (удобнее всего — одной транзакцией вместе с `swap(B → A, весь баланс)`, см. ниже).
+   Контракт проверяет, что TOKEN_B = 0, берёт `total_tokens` из **реального баланса** TOKEN_A
+   и снимает паузу.
+3. Прибыль или убыток (комиссия обмена, проскальзывание) автоматически делится между всеми
+   держателями shares: shares не меняются, меняется `total_tokens`.
+
+Все Raydium-инструкции вызывает только **админ** (иначе `Unauthorized`).
+
+### `add_pair_token`
+
+Админ один раз указывает второй токен пары. Создаётся токен-аккаунт vault для TOKEN_B:
+seeds `["vault_tokens_b", token_mint]`, владелец — vault PDA. В `VaultState` записываются `token_mint_b`
+и `vault_token_account_b`. Повторно вызвать нельзя: пара у vault задаётся один раз.
+
+### `swap(amount_in, min_amount_out, a_to_b)`
+
+Vault меняет `amount_in` своих токенов через пул Raydium CLMM (`a_to_b = true`: A → B, иначе B → A).
+
+- Это **CPI в Raydium** (`swap_v2`). Платит и подписывает vault PDA: токены его.
+- `min_amount_out` — защита от проскальзывания. Если пул отдаст меньше, Raydium откатит всю транзакцию
+  (`TooLittleOutputReceived`).
+- `amount_in = u64::MAX` — обменять **весь** баланс входного токена. Сумма берётся на цепочке в момент
+  выполнения. Это важно для возврата в TOKEN_A: TOKEN_B на аккаунт vault может перевести кто угодно, и если
+  админ передаст сумму, посчитанную заранее, на аккаунте останется «пыль», а `sync_vault` упадёт.
+  Поэтому правильно так — **одной транзакцией**:
+
+  ```ts
+  const syncIx = await program.methods.syncVault().accounts({...}).instruction();
+  await program.methods.swap(U64_MAX, minOut, false).accounts({...}).postInstructions([syncIx]).rpc();
+  ```
+- Контракт проверяет, что пул — это именно пара TOKEN_A / TOKEN_B vault (`WrongPool`).
+- Клиент передаёт в `remaining_accounts` tick arrays по пути обмена. Их подсказывает SDK:
+  `PoolUtils.computeAmountOutFormat(...).remainingAccounts` (пример — в `tests/raydium.ts`).
+
+### `sync_vault`
+
+Возвращает vault в обычный режим. Работает, только если TOKEN_B = 0 (иначе `TokenBNotZero`).
+
+---
+
 ## Требования
 
 | Инструмент | Версия | Установка |
@@ -250,9 +309,11 @@ yarn test
 
 ```
 vault-simple/
-├── programs/simple_vault/src/lib.rs   # контракт
+├── programs/simple_vault/src/lib.rs   # контракт: vault, карточки, deposit, withdraw
+├── programs/simple_vault/src/raydium.rs  # неделя 12: swap через Raydium (CPI)
 ├── scripts/create-clmm-pool.ts        # неделя 11: токены и CLMM-пул на Raydium
-├── tests/vault.ts                     # тесты
+├── tests/vault.ts                     # тесты недель 8–10
+├── tests/raydium.ts                   # тесты недели 12 (swap через пул)
 ├── Anchor.toml
 ├── Cargo.toml
 └── package.json
@@ -274,6 +335,11 @@ vault-simple/
 | `SharesTooSmall` | депозит слишком мал относительно vault | увеличь сумму |
 | `429 Too Many Requests` | лимит публичного devnet RPC | подожди или возьми свой RPC (`DEVNET_RPC`) |
 | `yarn create-pool` падает на `Insufficient funds` | мало SOL на devnet | пополни кошелёк (faucet.solana.com) |
+| `InMarket` при `deposit` / `withdraw` | деньги vault в TOKEN_B | админ: swap B → A, `sync_vault` |
+| `TokenBNotZero` при `sync_vault` | на vault остался TOKEN_B | `swap(u64::MAX, …, a_to_b = false)` и `sync_vault` одной транзакцией |
+| `WrongPool` | пул другой пары или перепутаны хранилища пула | проверь `poolState`, `inputVault` / `outputVault` |
+| `Unauthorized` | Raydium-инструкцию вызвал не админ | подписывай кошельком админа vault |
+| `TooLittleOutputReceived` | обмен дал меньше `min_amount_out` | уменьши `min_amount_out` или сумму обмена |
 
 ---
 
@@ -285,3 +351,4 @@ vault-simple/
 4. Написать тест: трое пользователей вносят разные суммы, проверить доли по shares.
 5. Добавить инструкцию `withdraw_all`, которая сжигает все shares пользователя за один вызов.
 6. Закрывать карточку (`close`), если у пользователя не осталось shares, и возвращать ренту.
+7. *(нед. 12)* Ограничить `swap`: не больше 50% TOKEN_A vault за один обмен.

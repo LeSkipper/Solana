@@ -1,6 +1,9 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Burn, Mint, MintTo, Token, TokenAccount, Transfer};
 
+pub mod raydium;
+use raydium::*;
+
 declare_id!("EbojNUfh9Jk6dyZaaQAJWofbdnkvdxfQbeAPq6iWoHAu");
 
 #[program]
@@ -42,6 +45,7 @@ pub mod simple_vault {
     ///   Последующие депозиты: shares = amount * total_shares / total_tokens
     pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
         require!(amount > 0, VaultError::ZeroAmount);
+        require!(!ctx.accounts.vault_state.in_market, VaultError::InMarket);
 
         let vault = &ctx.accounts.vault_state;
 
@@ -113,6 +117,7 @@ pub mod simple_vault {
     /// Формула: tokens = shares * total_tokens / total_shares
     pub fn withdraw(ctx: Context<Withdraw>, shares_amount: u64) -> Result<()> {
         require!(shares_amount > 0, VaultError::ZeroAmount);
+        require!(!ctx.accounts.vault_state.in_market, VaultError::InMarket);
 
         let vault = &ctx.accounts.vault_state;
         require!(vault.total_shares > 0, VaultError::VaultEmpty);
@@ -175,6 +180,28 @@ pub mod simple_vault {
             shares_amount, tokens_out, vault.total_tokens, vault.total_shares
         );
         Ok(())
+    }
+
+    // ─── Неделя 12: Raydium CLMM (код в raydium.rs) ─────────────────────────
+
+    /// Админ заводит vault второй токен пары (TOKEN_B пула).
+    pub fn add_pair_token(ctx: Context<AddPairToken>) -> Result<()> {
+        raydium::add_pair_token(ctx)
+    }
+
+    /// Неделя 12. Админ обменивает токены vault через пул Raydium.
+    pub fn swap<'a, 'b, 'c: 'info, 'info>(
+        ctx: Context<'a, 'b, 'c, 'info, VaultSwap<'info>>,
+        amount_in: u64,
+        min_amount_out: u64,
+        a_to_b: bool,
+    ) -> Result<()> {
+        raydium::swap(ctx, amount_in, min_amount_out, a_to_b)
+    }
+
+    /// Вернуть vault в обычный режим, когда всё снова в TOKEN_A.
+    pub fn sync_vault(ctx: Context<SyncVault>) -> Result<()> {
+        raydium::sync_vault(ctx)
     }
 }
 
@@ -374,17 +401,21 @@ pub struct Withdraw<'info> {
 #[account]
 #[derive(Default)]
 pub struct VaultState {
-    pub admin: Pubkey,               // 32
-    pub token_mint: Pubkey,          // 32 — SPL-токен vault'а
-    pub vault_token_account: Pubkey, // 32 — PDA для токенов
-    pub share_mint: Pubkey,          // 32 — mint для shares
+    pub admin: Pubkey,               // 32 — кто может создавать/настраивать
+    pub token_mint: Pubkey,          // 32 — SPL-токен, который принимает vault
+    pub vault_token_account: Pubkey, // 32 — токен-аккаунт vault PDA (где лежат токены)
+    pub share_mint: Pubkey,          // 32 — mint токенов-долей (shares)
     pub total_tokens: u64,           // 8  — всего токенов в vault
     pub total_shares: u64,           // 8  — всего выпущено shares
     pub bump: u8,                    // 1
+    pub token_mint_b: Pubkey,        // 32 — второй токен пары (неделя 12), default = нет
+    pub vault_token_account_b: Pubkey, // 32 — PDA для TOKEN_B
+    pub position_nft_mint: Pubkey,   // 32 — NFT открытой позиции (неделя 13), default = нет
+    pub in_market: bool,             // 1  — деньги в TOKEN_B/позиции: deposit и withdraw на паузе
 }
 
 impl VaultState {
-    pub const LEN: usize = 8 + 32 + 32 + 32 + 32 + 8 + 8 + 1;
+    pub const LEN: usize = 8 + 32 + 32 + 32 + 32 + 8 + 8 + 1 + 32 + 32 + 32 + 1;
 }
 
 /// Карточка пользователя в vault.
@@ -410,12 +441,32 @@ impl UserCard {
 pub enum VaultError {
     #[msg("Amount must be greater than zero")]
     ZeroAmount,
-    #[msg("Shares would be zero - deposit too small")]
+    #[msg("Deposit amount is too small to mint at least 1 share")]
     SharesTooSmall,
-    #[msg("Vault is empty")]
+    #[msg("Vault is empty, nothing to withdraw")]
     VaultEmpty,
-    #[msg("Withdraw amount too small")]
+    #[msg("Withdraw shares amount is too small to receive at least 1 token")]
     WithdrawTooSmall,
     #[msg("Math overflow")]
     MathOverflow,
+    #[msg("Unauthorized: only admin can call this")]
+    Unauthorized,
+    #[msg("Vault funds are in the market: deposit/withdraw paused until sync_vault")]
+    InMarket,
+    #[msg("Pair token (TOKEN_B) is not set: call add_pair_token")]
+    PairNotSet,
+    #[msg("Pair token must differ from vault token")]
+    SameToken,
+    #[msg("Pool does not match vault token pair")]
+    WrongPool,
+    #[msg("tick_lower must be less than tick_upper")]
+    InvalidTickRange,
+    #[msg("Position is already open")]
+    PositionAlreadyOpen,
+    #[msg("No open position")]
+    NoOpenPosition,
+    #[msg("Cannot sync: position is still open, call close_position first")]
+    PositionOpen,
+    #[msg("Cannot sync: vault still holds TOKEN_B, swap it back to TOKEN_A first")]
+    TokenBNotZero,
 }
